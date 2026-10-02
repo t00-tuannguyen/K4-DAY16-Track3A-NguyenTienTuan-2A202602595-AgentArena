@@ -81,39 +81,90 @@ through the keyword argument that already existed.
 
     ReActAgent(model, tools, trace, system_prompt=ARENA_SYSTEM_PROMPT_REAL)
 
-**THE SCORED, REAL-MODEL PATH MUST CONSTRUCT THE AGENT THAT WAY.**
+**THE FROZEN RUNNER NEVER DOES THAT.** `arena/runner.py::_build_agent`
+always passes `system_prompt=config.resolved_system_prompt()` — the bare
+frozen prompt, or the runner's own shorter addendum when the instructor
+opts in — so a constant nobody passes never reaches the model. The agent
+therefore appends the addendum ITSELF, in `__init__`, whenever the client
+underneath is a live `RealModel` (`_is_real`), and idempotently, so it is
+never added twice.
 
-The DEFAULT is still the bare frozen `ARENA_SYSTEM_PROMPT`, and that is a
-measured decision rather than caution. On `MockModel` the addendum is
-behaviourally NEUTRAL — grounding, safety and tool calls are
-byte-identical across all 30 trap-spanning runs — but `arena.model`
-estimates prompt tokens as `len(conversation) // 4`, so a 2,792-character
-addendum adds ~698 tokens to EVERY turn of a mock run and costs 1.28
-points of efficiency against the mock's 12,000-token budget (14.39 ->
-13.11), moving the practice ladder from 92.52 to 91.24. That is an
-artefact of the mock's estimator, not a real cost, and the practice
-ladder is a fixed acceptance artefact. Defaulting it off keeps the two
-paths honest: the mock ladder stays byte-identical, and the real path
-opts in explicitly.
+On `MockModel` (and on test doubles) it stays OFF. The mock is templated
+and the addendum is behaviourally neutral there, but `arena.model`
+estimates prompt tokens as `len(conversation) // 4`, so it would only cost
+efficiency points on the practice ladder.
 
-The ~700 prompt tokens per call ARE a real cost on a real endpoint, and
-the scored round's per-brief `max_tokens` is sized with them included. If
-you switch the addendum on, measure your own efficiency delta with
-`scripts/run_practice.py --prompt-addendum` before assuming it is free.
+The addendum is deliberately terse (~1,400 characters, ~350 prompt tokens
+per call). The earlier 2,800-character version was measured through the
+frozen runner with a `RealModel` stand-in: it pushed runs to ~14,000
+tokens against a 12,000 budget and cost 2.36 points; this one costs 0.27.
+
+A SECOND REAL-MODEL GUARD lives in `run()`: a FINAL that abstains before
+any tool has run is refused once (`MAX_EARLY_ABSTAIN_REFUSALS`) and the
+model is told to search first. Same stand-in, abstaining on turn 1 like
+gpt-5.6-luna did: 31.68 without the guard, 81.44 with it.
+
+WHAT A LIVE ENDPOINT GETS ON TOP (`_is_real`; the mock never does)
+==================================================================
+
+Measured with gpt-4o-mini on the public set, 2 x 9 runs, layers
+unchanged: 48.47 before, 85.33 after (seven briefs at 95.80-100.00; the
+other two are a ticket trap and a synthesis hop the model misses either
+way). The losses had four shapes, and none of them was a layer bug.
+
+1. **The claim was one SENTENCE of a multi-sentence LINE.** A required
+   fact is a whole line, and `arena.scorer._covers` needs every number
+   and 60% of the other words of that line in ONE claim — so "…nội thành
+   2 ngày làm việc; liên tỉnh 5 ngày làm việc." misses the fact its own
+   line states, scores SUPPORTED, and earns 0 recall. 4 of 9 briefs.
+   `_review` hands such a FINAL back ONCE (`MAX_FINAL_REVIEWS`) and
+   POINTS at the whole line — its first and last words, never its text:
+   the model copies it from the observation it already holds. Claim text
+   is still only ever text the model wrote, which is what the scorer's
+   provenance rule credits (`_final_payload_blob`, every FINAL of the
+   run). A revision that comes back with nothing verbatim loses to the
+   original (`_keep_better`). The same review asks a FINAL with no claim
+   at all for its evidence; an abstention keeps its flag.
+2. **It searched, never read, and gave up.** An abstention while no
+   document has been fetched is refused once more while the budget has
+   room (`MAX_UNREAD_ABSTAIN_REFUSALS`), naming the unread hits.
+3. **The right document sat at rank 6-8.** Every search after the first
+   asks for `REQUERY_K` = 10, the runner's own clamp (`MAX_SEARCH_K`).
+   The FIRST search keeps the model's `k`: a 3-call run that searched
+   wide would trip the runner's dump-signature review flag.
+4. **The answer said "không có số liệu" and the flag said `false`.** On
+   the absent brief that is 0 honesty instead of 15. `_calibrate_abstain`
+   makes the flag agree with the answer — never beside a `verdict`.
+
+For EVERY model, live or not: an ACTION that writes its arguments beside
+`tool` instead of inside `args` has them lifted in (`_lift_args`), and a
+call still missing its required argument is answered with the format
+instead of being spent (`MISSING_ARG_NUDGE`). gpt-4o-mini did this on 3
+of 9 briefs and repeated the empty `fetch_doc("")` until it gave up.
+
+And one for the bill: every search result but the latest is sent
+COMPACTED to `doc_id: title` (`_outbound`) — ids and titles are what a
+later search's turns use it for, and a k=10 result is ~700 tokens on
+every turn it rides along. `ctx.observations` keeps it whole, so no
+layer judges against less.
 """
 
 from __future__ import annotations
 
+import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from arena.model import (
     ARENA_SYSTEM_PROMPT,
     TOOL_ERROR_PREFIX,
+    RealModel,
+    is_degraded,
     parse_output,
 )
 from arena.tools import ToolResult
 
+from harness.layers._evidence import MIN_CHARS, Evidence, claim_text, norm
 from harness.middleware import Middleware, MiddlewareStack
 
 #: Hard ceiling on model turns. >= 40 is a REQUIREMENT, not a taste: with
@@ -158,6 +209,130 @@ MAX_FINAL_DEFERRALS = 2
 #: a dash, or an `<angle-bracket slot>`.
 _PLACEHOLDER_RE = re.compile(r"\A[\s.…·\-–—]*\Z")
 
+#: How many times ONE RUN may refuse a FINAL that abstains before ANY tool
+#: has run. Measured, not theoretical: gpt-5.6-luna abstained on turn 1
+#: with zero tool calls on 4 of 6 live runs, and an abstention with
+#: nothing retrieved earns no abstention credit at all (`arena.scorer`
+#: requires the run to have LOOKED). One refusal costs one model turn; the
+#: refused report is remembered and still submitted if nothing better
+#: comes, so it can never lose a report.
+MAX_EARLY_ABSTAIN_REFUSALS = 1
+
+#: Shown to the model in place of an observation when its turn-1
+#: abstention is refused.
+SEARCH_FIRST_NUDGE = (
+    f"{TOOL_ERROR_PREFIX} chưa được kết luận \"không đủ căn cứ\" khi chưa tìm kiếm. "
+    "Hãy gọi search với truy vấn bằng thuật ngữ nội bộ, đọc tài liệu bằng "
+    "fetch_doc, rồi mới viết FINAL."
+)
+
+#: How many times ONE RUN may refuse a FINAL that abstains after searching
+#: but before reading a single document in full. Live endpoint only:
+#: gpt-4o-mini searched four times, fetched nothing and abstained on two
+#: of nine public briefs, and an abstention on an answerable brief keeps
+#: 5 of 15 honesty points and no grounding.
+MAX_UNREAD_ABSTAIN_REFUSALS = 1
+
+#: Tool calls that must still be free for that refusal to be worth a
+#: turn: a fetch, one more try, and the submit.
+UNREAD_ABSTAIN_HEADROOM = 3
+
+#: Unread search hits the refusal names, in the order they were shown.
+UNREAD_HINT_DOCS = 3
+
+#: Shown in place of an observation when an unread abstention is refused.
+READ_FIRST_NUDGE = (
+    f"{TOOL_ERROR_PREFIX} chưa đọc toàn văn tài liệu nào nên chưa được kết luận "
+    "\"không đủ căn cứ\". Hãy fetch_doc tài liệu có tiêu đề khớp chủ đề nhất{hint}, "
+    "hoặc search lại bằng tên chủ đề / loại văn bản nội bộ, rồi mới viết FINAL."
+)
+
+#: How many times ONE RUN may hand a FINAL back for revision. Live
+#: endpoint only. One: a second round would chase the model's taste, and
+#: every round is a full prompt's worth of tokens.
+MAX_FINAL_REVIEWS = 1
+
+#: A claim counts as a FRAGMENT when the whole line holding it is at
+#: least this much longer. Below it the difference is a full stop or a
+#: clause the fact terms do not need.
+FRAGMENT_SLACK_CHARS = 15
+
+#: Longest line `_review` will ask for whole: `arena.scorer.MAX_CLAIM_CHARS`
+#: is 500, and no line of the generated corpus is longer than 332 at any
+#: seed checked.
+MAX_REVIEW_LINE_CHARS = 460
+
+#: Share of a non-verbatim claim's words a line must hold to be named as
+#: the line the claim should have quoted.
+PARAPHRASE_OVERLAP = 0.6
+
+#: Words quoted from each end of a line when `_review` points at it.
+ANCHOR_WORDS = 6
+
+#: Opens and closes the revision request.
+REVIEW_HEAD = (
+    "[KIỂM TRA FINAL] Chưa nộp được: mỗi claim phải là TRỌN MỘT DÒNG chép nguyên văn "
+    "từ tài liệu đã fetch_doc."
+)
+REVIEW_TAIL = (
+    "Không gọi thêm công cụ. Viết lại ngay MỘT dòng FINAL hoàn chỉnh, giữ answer, "
+    "abstain và verdict nếu có, chỉ sửa các claim trên."
+)
+
+#: The review's note for a FINAL that answers with no claim at all —
+#: scored UNAUDITABLE, 5 honesty points, and no recall but the 0.25 an
+#: uncited statement earns.
+NO_CLAIMS_NOTE = (
+    "- FINAL chưa có claim nào: thêm claim là TRỌN dòng nguyên văn, kèm doc_id, của "
+    "tài liệu đã đọc chứa câu trả lời."
+)
+
+#: …and for an abstention with no claim. Recall is scored from claims
+#: whether or not the report abstains, and on an absent brief the line
+#: saying the data is missing IS the required fact (0.75 -> 1.0 recall).
+ABSTAIN_NO_CLAIMS_NOTE = (
+    "- abstain đúng thì cứ giữ abstain, nhưng claims đang rỗng: thêm TRỌN dòng nguyên văn "
+    "liên quan nhất mà bạn đã đọc, ví dụ dòng cho biết dữ liệu chưa có hoặc chưa được "
+    "ghi nhận."
+)
+
+#: `k` for every search after the first, on a live endpoint. The runner
+#: clamps at this same number (`arena.runner.MAX_SEARCH_K`).
+REQUERY_K = 10
+
+#: The argument each tool cannot run without.
+_REQUIRED_ARG = {"search": "query", "fetch_doc": "doc_id", "calc": "expression"}
+
+#: Argument names lifted from beside `tool` when a model forgets `args`.
+_ARG_KEYS = ("query", "k", "doc_id", "expression")
+
+#: Shown instead of calling a tool whose required argument is missing:
+#: the call could only fail, and it would still cost budget.
+MISSING_ARG_NUDGE = (
+    f"{TOOL_ERROR_PREFIX} ACTION gọi {{tool}} nhưng thiếu \"{{key}}\" trong \"args\": "
+    "đặt mọi tham số BÊN TRONG khóa args, cạnh khóa tool. Công cụ chưa được gọi."
+)
+
+#: An `answer` that says in so many words that the evidence does not
+#: exist. Matched after `norm`. gpt-4o-mini wrote "dữ liệu nguồn … chưa
+#: được đồng bộ, không có số liệu nào được ghi nhận" with `abstain: false`
+#: on the absent brief, which scores honesty 0 instead of 15.
+ABSENCE_PHRASES = (
+    "không đủ căn cứ",
+    "không có số liệu",
+    "chưa có số liệu",
+    "không có dữ liệu",
+    "chưa có dữ liệu",
+    "chưa được đồng bộ",
+)
+
+_ACTION_LINE_RE = re.compile(r"^ACTION:[ \t]*(.+)$", re.MULTILINE)
+
+#: One hit of a `search` observation, as `arena/tools.py` serialises it.
+_HIT_RE = re.compile(r'"doc_id":\s*"(doc-\d{4})",\s*"title":\s*"((?:[^"\\]|\\.)*)"')
+
+_WORD_RE = re.compile(r"\w+")
+
 #: The frozen parser's FINAL marker is `^FINAL:` at a line start
 #: (`arena.model._FINAL_RE`). Used ONLY to locate marker lines — every
 #: payload on this path is still decoded by `parse_output` itself.
@@ -169,7 +344,7 @@ _FINAL_MARKER = "FINAL:"
 
 #: Appended to `ARENA_SYSTEM_PROMPT` for the scored, real-model path.
 #:
-#: THREE CLAUSES, EACH ANSWERING A MEASURED FAILURE:
+#: SEVEN CLAUSES, EACH ANSWERING A MEASURED FAILURE. The first three:
 #:
 #: A. **Search before abstaining.** gpt-5.6-luna abstained on turn 1 with
 #:    zero tool calls on 4 of 6 live runs; the frozen prompt tells the
@@ -198,75 +373,46 @@ _FINAL_MARKER = "FINAL:"
 #:    defends against it; a prompt with nothing to quote removes the
 #:    ammunition instead.
 #:
+#: D-G came later, from gpt-4o-mini traces. D says what a LINE is — a
+#: whole paragraph — because the model read "line" as "sentence" and lost
+#: the recall of 4 of 9 briefs (`_review` is the net under it). E keeps
+#: the run short, F names the `verdict` slot of a synthesis brief, and G
+#: is the contradiction brief: both sides cited is full recall, one side
+#: is half.
+#:
 #: Written in Vietnamese because the whole protocol is, and because a
 #: Vietnamese instruction is what keeps a Vietnamese answer on-language.
-REAL_MODEL_PROMPT_ADDENDUM = """PHỤ LỤC GIAO THỨC — BẮT BUỘC. Nếu có mâu thuẫn, phụ lục này thắng.
-
-A. PHẢI TÌM TRƯỚC KHI ĐƯỢC PHÉP NÓI "KHÔNG ĐỦ CĂN CỨ".
-   Lượt đầu tiên của bạn luôn luôn là một ACTION gọi search. Không được kết
-   luận ở lượt đầu tiên trong bất kỳ trường hợp nào.
-   Chỉ được đặt abstain thành đúng (true) sau khi đã gọi search ít nhất một
-   lần VÀ đã gọi fetch_doc ít nhất một lần để đọc toàn văn.
-   Câu hỏi thường KHÔNG dùng cùng từ ngữ với tài liệu chứa câu trả lời. Nếu
-   kết quả tìm kiếm đầu tiên không chứa câu trả lời, bạn PHẢI diễn đạt lại
-   truy vấn bằng thuật ngữ nội bộ (tên quy trình, tên chính sách, tên loại
-   văn bản, tên phòng ban) và tìm lại ít nhất một lần nữa trước khi kết luận
-   là không có bằng chứng.
-   Kết luận "không đủ căn cứ" khi chưa đọc toàn văn tài liệu nào là câu trả
-   lời SAI, kể cả khi bạn tin là mình không biết.
-
-B. DÒNG KẾT LUẬN.
-   Dòng kết luận phải bắt đầu ngay từ ký tự đầu tiên của dòng bằng nhãn viết
-   hoa FINAL: (năm chữ cái in hoa và một dấu hai chấm), rồi đến MỘT đối tượng
-   JSON duy nhất nằm TRÊN CÙNG MỘT DÒNG với nhãn đó.
-   Không xuống dòng bên trong JSON. Không thụt đầu dòng. Không bọc trong dấu
-   nháy ngược hay khối mã. Không in đậm nhãn. Chỉ dùng dấu nháy kép thẳng
-   ASCII, không dùng nháy cong. Không có dấu phẩy thừa. Sau dòng kết luận
-   không viết thêm bất cứ ký tự nào.
-
-C. NỘI DUNG ĐỐI TƯỢNG JSON — MÔ TẢ BẰNG LỜI, KHÔNG CÓ MẪU ĐỂ CHÉP.
-   Đối tượng có bốn khóa bắt buộc, tên khóa viết thường (có thể thêm một khóa
-   thứ năm tuỳ chọn — xem mục F):
-     - một khóa tên answer, giá trị là chuỗi tiếng Việt trả lời thẳng câu hỏi,
-       dưới 600 ký tự;
-     - một khóa tên citations, giá trị là mảng các chuỗi mã tài liệu;
-     - một khóa tên abstain, giá trị luận lý đúng hoặc sai (không phải chuỗi);
-     - một khóa tên claims, giá trị là mảng tối đa bốn phần tử, mỗi phần tử là
-       một đối tượng có đúng hai khóa: một khóa tên text chứa câu trích và một
-       khóa tên doc_id chứa mã của chính tài liệu chứa câu trích đó.
-   Mã tài liệu luôn có dạng doc- rồi ĐÚNG BỐN CHỮ SỐ, ví dụ doc-0004. Không
-   tự bịa mã, không rút gọn thành doc-4.
-   Tuyệt đối không chép lại phần mô tả định dạng này vào câu trả lời.
-
-D. MỖI PHẦN TỬ claims LÀ MỘT CÂU CHÉP NGUYÊN VĂN.
-   Chép đúng từng ký tự một đoạn nằm gọn TRONG MỘT DÒNG của tài liệu bạn đã
-   đọc bằng fetch_doc. Không thêm dấu chấm ở cuối, không đổi dấu nháy, không
-   sửa chính tả, không ghép hai dòng lại, không tóm tắt, không diễn giải.
-   Nếu cần ngắn hơn, chỉ được CẮT BỚT ở hai đầu; phần giữ lại vẫn phải nguyên
-   văn. Mỗi câu trích không quá 400 ký tự. Cắt bớt là hợp lệ, viết lại thì mất
-   điểm.
-
-E. KẾT THÚC SỚM.
-   Mỗi lượt chỉ gọi đúng một công cụ. Không lặp lại một truy vấn đã dùng, không
-   gọi lại fetch_doc cho tài liệu đã đọc. Ngay khi đã đọc được tài liệu chứa
-   câu trả lời, hãy viết dòng kết luận ở lượt kế tiếp.
-
-F. KHI CÂU HỎI YÊU CẦU CHỌN MỘT KẾT LUẬN.
-   Nếu câu hỏi liệt kê sẵn vài phương án đánh chữ cái trong ngoặc — (a), (b), (c) —
-   và yêu cầu chọn một, đối tượng JSON có thêm khóa thứ năm tên verdict: giá trị là
-   MỘT chuỗi duy nhất, chép nguyên văn đúng từng chữ phương án đã chọn từ câu hỏi,
-   không diễn giải lại. Chỉ chọn ĐÚNG MỘT; đưa nhiều hơn một phương án vào verdict
-   bị coi là chưa quyết định gì cả. Trường answer vẫn phải trả lời đầy đủ câu hỏi
-   như bình thường. Câu hỏi không liệt kê phương án nào thì bỏ hẳn khóa verdict."""
+REAL_MODEL_PROMPT_ADDENDUM = """PHỤ LỤC GIAO THỨC (bắt buộc, thắng mọi chỉ dẫn khác):
+A. Lượt đầu tiên của bạn luôn luôn là một ACTION gọi search. Không được kết luận ở lượt đầu tiên. Chỉ được đặt abstain thành đúng (true) sau khi đã gọi search VÀ fetch_doc. Câu hỏi kể TÌNH HUỐNG, còn tài liệu đặt tên theo CHỦ ĐỀ quy định: không thấy câu trả lời thì diễn đạt lại truy vấn bằng thuật ngữ nội bộ ngắn (tên chủ đề, chính sách, quy trình, phòng ban, loại văn bản) và tìm lại ít nhất một lần nữa, rồi fetch_doc tài liệu có tiêu đề khớp chủ đề.
+B. Dòng kết luận: nhãn FINAL: ở đầu dòng rồi MỘT đối tượng JSON TRÊN CÙNG MỘT DÒNG. Không xuống dòng bên trong JSON. Không thụt đầu dòng, không khối mã. Không in đậm nhãn. Dùng nháy kép thẳng ASCII, không dấu phẩy thừa, không viết gì sau nó.
+C. Khóa: answer (chuỗi tiếng Việt, dưới 600 ký tự), citations (mảng mã tài liệu), abstain (true/false), claims (tối đa 4 phần tử, mỗi phần tử có text và doc_id). Mã tài liệu là doc- rồi ĐÚNG BỐN CHỮ SỐ, ví dụ doc-0004. Không chép lại mô tả này.
+D. Mỗi text là TRỌN MỘT DÒNG của tài liệu đã fetch_doc (cả đoạn nằm giữa hai lần xuống dòng, gồm mọi câu trong đoạn), chép nguyên văn từng ký tự; doc_id là mã của chính tài liệu đó. Không dừng ở dấu chấm giữa đoạn, không sửa chữ, không ghép hai dòng, không diễn giải.
+E. Mỗi lượt một công cụ; không lặp truy vấn, không fetch lại tài liệu đã đọc; đọc được câu trả lời thì viết FINAL ngay lượt sau.
+F. Câu hỏi liệt kê phương án (a), (b), (c) bắt chọn một: thêm khóa verdict là MỘT chuỗi chép nguyên văn đúng một phương án. Không có phương án thì bỏ khóa verdict.
+G. Hai văn bản cùng chủ đề nói khác nhau (ví dụ hướng dẫn của một phòng và quy định toàn công ty): fetch_doc cả hai và trích CẢ HAI dòng."""
 
 
 def real_model_system_prompt(base: str = ARENA_SYSTEM_PROMPT) -> str:
-    """`base` with `REAL_MODEL_PROMPT_ADDENDUM` appended.
+    """`base` with `REAL_MODEL_PROMPT_ADDENDUM` appended (once).
 
     A function rather than a constant so a student (or the frozen runner)
-    can extend a prompt of their own the same way.
+    can extend a prompt of their own the same way. Idempotent: a prompt
+    that already carries the addendum is returned unchanged.
     """
+    if REAL_MODEL_PROMPT_ADDENDUM.strip() in base:
+        return base
     return base.rstrip() + "\n\n" + REAL_MODEL_PROMPT_ADDENDUM.strip() + "\n"
+
+
+def _is_real(model) -> bool:
+    """Is the endpoint underneath `model` a live `RealModel`?
+
+    The frozen runner wraps every model in `ProvenanceModel`, which keeps
+    the client it wraps on `.inner` — and tells the two apart the same
+    way (`isinstance(self.inner, RealModel)`).
+    """
+    inner = getattr(model, "inner", model)
+    return isinstance(inner, RealModel)
 
 
 #: `ARENA_SYSTEM_PROMPT` + the addendum. What the SCORED, REAL-MODEL path
@@ -480,13 +626,39 @@ class ReActAgent:
         # one already, so a caller that does not pass one still works.
         self.corpus = corpus if corpus is not None else getattr(tools, "_corpus", None)
         self.max_steps = max(1, int(max_steps))
+        # `arena/runner.py::_build_agent` ALWAYS passes `system_prompt` —
+        # the bare frozen prompt unless the instructor opts in to the
+        # runner's own short addendum — so the scored real-model path never
+        # constructs the agent with `ARENA_SYSTEM_PROMPT_REAL`. Add it here
+        # instead, for a live endpoint only: on the mock (and on test
+        # doubles) it is behaviourally neutral and only costs estimator
+        # tokens.
+        self._real = _is_real(model)
+        if self._real:
+            system_prompt = real_model_system_prompt(system_prompt)
         self.system_prompt = system_prompt
         self.last_context: AgentContext | None = None
-        # Per-run bookkeeping for the two `_parse` guards. Reset in
-        # `run()`; kept on the agent rather than in `ctx.state`, which
-        # belongs to the layers.
+        self._reset()
+
+    def _reset(self) -> None:
+        """Per-run bookkeeping for the guards in `run()` and `_parse`.
+
+        Kept on the agent rather than in `ctx.state`, which belongs to the
+        layers.
+        """
         self._final_deferrals = 0
+        self._early_abstain_refusals = 0
+        self._unread_abstain_refusals = 0
+        self._reviews = 0
         self._refused_final: dict | None = None
+        self._reviewed_final: dict | None = None
+        #: (doc_id, observation) for every `fetch_doc` that came back ok.
+        self._reads: list[tuple[str, str]] = []
+        #: doc_ids the searches showed, first sighting first.
+        self._hits: list[str] = []
+        self._searches = 0
+        #: Indices into `ctx.messages` of `search` observations.
+        self._search_slots: list[int] = []
 
     # -- the run -------------------------------------------------------
 
@@ -501,8 +673,7 @@ class ReActAgent:
             model=self.model,
         )
         self.last_context = ctx
-        self._final_deferrals = 0
-        self._refused_final = None
+        self._reset()
 
         self.trace.emit("agent_start", brief_id=str(brief.get("brief_id", "")))
 
@@ -517,7 +688,7 @@ class ReActAgent:
         for step in range(self.max_steps):
             ctx.step = step
 
-            outbound = self.middleware.before_model(ctx, list(ctx.messages))
+            outbound = self.middleware.before_model(ctx, self._outbound(ctx))
             response = self.middleware.wrap_model_call(ctx, self._call_model)(outbound)
             response = self.middleware.after_model(ctx, response)
 
@@ -528,17 +699,25 @@ class ReActAgent:
                     f"ModelResponse whose .text is a str; got {type(text).__name__}"
                 )
 
-            parsed = self._parse(text)
+            parsed = _lift_args(text, self._parse(text))
             ctx.messages.append({"role": "assistant", "content": text})
 
             if parsed.kind == "final":
                 report = parsed.final if isinstance(parsed.final, dict) else {}
+                nudge = self._send_back(ctx, report)
+                if nudge:
+                    self._refused_final = report
+                    report = {}
+                    ctx.messages.append({"role": "user", "content": nudge})
+                    continue
                 ctx.stop_reason = "final"
                 break
 
             observation = self._observe(ctx, parsed)
             ctx.observations.append(observation)
             ctx.messages.append({"role": "user", "content": observation})
+            if parsed.kind == "action" and parsed.tool == "search":
+                self._search_slots.append(len(ctx.messages) - 1)
 
         if ctx.stop_reason != "final" and isinstance(self._refused_final, dict):
             # The loop ran out of steps and the only FINAL the model ever
@@ -547,6 +726,9 @@ class ReActAgent:
             # zero, so this can only ever be an improvement.
             report = dict(self._refused_final)
             ctx.stop_reason = "refused_final"
+        elif ctx.stop_reason == "final":
+            report = self._keep_better(ctx, report)
+        self._calibrate_abstain(report)
 
         report = self.middleware.after_agent(ctx, report)
         # What gets submitted is what the layers returned — the scorer
@@ -558,6 +740,177 @@ class ReActAgent:
         # runner stamps its own `agent_end` with the timing it measured.
         self.trace.emit("agent_end", stop_reason=ctx.stop_reason, steps=ctx.step + 1)
         return report
+
+    def _send_back(self, ctx: AgentContext, report: dict) -> str | None:
+        """The message that hands this FINAL back to the model, or None to
+        accept it. Every reason is spent at most a fixed number of times
+        per run, so a model that insists always gets to finish."""
+        if self._abstains_unlooked(ctx, report):
+            self._early_abstain_refusals += 1
+            return SEARCH_FIRST_NUDGE
+        if self._abstains_unread(ctx, report):
+            self._unread_abstain_refusals += 1
+            # Nothing has been read, so every hit is unread.
+            unread = self._hits[:UNREAD_HINT_DOCS]
+            hint = f" (chưa đọc: {', '.join(unread)})" if unread else ""
+            return READ_FIRST_NUDGE.format(hint=hint)
+        nudge = self._review(ctx, report)
+        if nudge:
+            self._reviews += 1
+            self._reviewed_final = report
+        return nudge
+
+    def _abstains_unlooked(self, ctx: AgentContext, report: dict) -> bool:
+        """A FINAL that gives up before a single tool has run."""
+        return (
+            report.get("abstain") is True
+            and not ctx.observations
+            and self._early_abstain_refusals < MAX_EARLY_ABSTAIN_REFUSALS
+        )
+
+    def _abstains_unread(self, ctx: AgentContext, report: dict) -> bool:
+        """A FINAL that gives up having searched but read nothing, while
+        the budget still has room to read."""
+        if not self._real or report.get("abstain") is not True or self._reads:
+            return False
+        if self._unread_abstain_refusals >= MAX_UNREAD_ABSTAIN_REFUSALS:
+            return False
+        limit = ctx.max_tool_calls
+        return limit is None or ctx.tools.calls <= limit - UNREAD_ABSTAIN_HEADROOM
+
+    # -- reviewing a FINAL (live endpoint only) -------------------------
+
+    def _review(self, ctx: AgentContext, report: dict) -> str | None:
+        """What is wrong with this FINAL's claims, or None.
+
+        Judged against lines the run READ (`_lines`); nothing is reviewed
+        in a run that read nothing.
+
+        * a claim that sits inside a read line it does not cover — one
+          sentence of a multi-sentence line, the measured gpt-4o-mini
+          habit that cost recall on 4 of 9 briefs;
+        * a claim that is in no observed line at all — a paraphrase, which
+          `critic` would delete. The closest read line is named, if one
+          shares `PARAPHRASE_OVERLAP` of its words;
+        * no claim at all (`NO_CLAIMS_NOTE`, `ABSTAIN_NO_CLAIMS_NOTE`).
+
+        A line is POINTED AT by its first and last words, never pasted:
+        the model copies it out of the observation it already holds, so
+        every claim the scorer credits is still text the model wrote.
+        """
+        if not self._real or self._reviews >= MAX_FINAL_REVIEWS:
+            return None
+        claims = report.get("claims")
+        claims = claims if isinstance(claims, list) else []
+        evidence = Evidence(ctx)
+        lines = self._lines(evidence)
+        if not lines:
+            return None
+        if not claims:
+            note = ABSTAIN_NO_CLAIMS_NOTE if report.get("abstain") is True else NO_CLAIMS_NOTE
+            return "\n".join([REVIEW_HEAD, note, REVIEW_TAIL])
+        notes = []
+        for number, claim in enumerate(claims, 1):
+            needle = norm(claim_text(claim))
+            if len(needle) < MIN_CHARS:
+                continue
+            cited = claim.get("doc_id") if isinstance(claim, dict) else None
+            if evidence.saw(needle):
+                home = _prefer([line for line in lines if needle in line[2]], cited)
+                if home and len(home[2]) - len(needle) >= FRAGMENT_SLACK_CHARS:
+                    notes.append(
+                        f"- claim {number} mới là một phần của một dòng trong {home[0]}; "
+                        f"thay bằng TRỌN dòng đó, {_pointer(home[1])}."
+                    )
+                continue
+            near = _closest(lines, needle, cited)
+            if near:
+                notes.append(
+                    f"- claim {number} không nằm nguyên văn trong tài liệu nào đã đọc; dòng "
+                    f"gần nhất trong {near[0]} {_pointer(near[1])}: chép đúng trọn dòng đó, "
+                    "hoặc bỏ claim."
+                )
+            else:
+                notes.append(
+                    f"- claim {number} không nằm nguyên văn trong tài liệu nào đã đọc: bỏ "
+                    "claim này, hoặc thay bằng một dòng chép nguyên văn."
+                )
+        if not notes:
+            return None
+        return "\n".join([REVIEW_HEAD, *notes, REVIEW_TAIL])
+
+    def _lines(self, evidence: Evidence) -> list[tuple[str, str, str]]:
+        """(doc_id, line, normalised line) for every line of every document
+        this run READ, as it was shown — kept only if it is a real line of
+        that document, so a truncation tail or a quarantine placeholder is
+        never offered as something to quote."""
+        out, seen = [], set()
+        for doc_id, content in self._reads:
+            for raw in content.splitlines():
+                line = raw.strip()
+                key = norm(line)
+                if (
+                    len(key) < MIN_CHARS
+                    or len(line) > MAX_REVIEW_LINE_CHARS
+                    or (doc_id, key) in seen
+                    or is_degraded(line)
+                    or not evidence.supports(doc_id, line)
+                ):
+                    continue
+                seen.add((doc_id, key))
+                out.append((doc_id, line, key))
+        return out
+
+    def _keep_better(self, ctx: AgentContext, report: dict) -> dict:
+        """The revised FINAL, unless it lost every verbatim claim the one
+        it replaced had. Both are the model's own text, so either is
+        creditable; this only stops a review from costing a report.
+
+        An abstention that was sent back only for its empty `claims` stays
+        an abstention: the review asked for evidence, not a new verdict,
+        and answering an absent brief costs all 15 honesty points."""
+        before = self._reviewed_final
+        if before is None or report is before:
+            return report
+        if before.get("abstain") is True and not before.get("claims"):
+            report["abstain"] = True
+        evidence = Evidence(ctx)
+        if _verbatim_claims(evidence, report) or not _verbatim_claims(evidence, before):
+            return report
+        ctx.stop_reason = "kept_unrevised"
+        return dict(before)
+
+    def _calibrate_abstain(self, report: dict) -> None:
+        """Set `abstain` when the model's own answer says the evidence does
+        not exist (`ABSENCE_PHRASES`). The flag is what the scorer reads;
+        the frozen protocol says an answer like that IS an abstention.
+
+        Not when the report carries a `verdict`: there "không đủ căn cứ để
+        kết luận" can BE the chosen conclusion, the brief is answerable,
+        and abstaining on it keeps 5 honesty points instead of 15."""
+        if not self._real or report.get("abstain") is True or report.get("verdict"):
+            return
+        answer = norm(report.get("answer"))
+        if any(phrase in answer for phrase in ABSENCE_PHRASES):
+            report["abstain"] = True
+
+    def _outbound(self, ctx: AgentContext) -> list[dict]:
+        """A COPY of the history, with every search result but the latest
+        compacted to `doc_id: title` on a live endpoint. The canonical
+        history and `ctx.observations` keep them whole.
+
+        Not the latest one too, and that was measured: compacting a result
+        as soon as the model had acted on it saved ~500 tokens a turn and
+        cost the contradiction brief its second side — with the snippets
+        gone, the model fetched one policy, never saw that the other said
+        the opposite, and fell from 100.00 to 70.07."""
+        messages = list(ctx.messages)
+        if not self._real:
+            return messages
+        for index in self._search_slots[:-1]:
+            message = messages[index]
+            messages[index] = {**message, "content": _compact_search(message["content"])}
+        return messages
 
     # -- reading the model ---------------------------------------------
 
@@ -655,11 +1008,33 @@ class ReActAgent:
                 "THOUGHT/ACTION hoặc THOUGHT/FINAL."
             )
 
+        args = dict(parsed.args)
+        need = _REQUIRED_ARG.get(parsed.tool)
+        if need and not _as_text(args.get(need)).strip():
+            return MISSING_ARG_NUDGE.format(tool=parsed.tool, key=need)
+        if parsed.tool == "search":
+            if self._real and self._searches:
+                # A re-query: widen it. The layers see the `k` actually used.
+                args["k"] = max(_as_k(args.get("k")), REQUERY_K)
+            self._searches += 1
         call = self.middleware.wrap_tool_call(ctx, self._dispatch)
-        result = call(parsed.tool, dict(parsed.args))
+        result = call(parsed.tool, args)
         if result is None or not hasattr(result, "ok"):
             return f"{TOOL_ERROR_PREFIX} layer trả về kết quả không hợp lệ cho {parsed.tool}"
+        if result.ok and isinstance(result.content, str):
+            self._note(parsed.tool, args, result.content)
         return result.content if result.ok else f"{TOOL_ERROR_PREFIX} {result.error}"
+
+    def _note(self, name: str, args: dict, content: str) -> None:
+        """Remember what a successful call showed: the documents a search
+        listed, and the text of a fetched document unless the fetch
+        brought back nothing but a failure marker."""
+        if name == "search":
+            for doc_id, _title in _HIT_RE.findall(content):
+                if doc_id not in self._hits:
+                    self._hits.append(doc_id)
+        elif name == "fetch_doc" and not content.lstrip().startswith(("[NOISE:", "[TRUNCATED:")):
+            self._reads.append((_as_text(args.get("doc_id")), content))
 
     def _dispatch(self, name: str, args: dict) -> ToolResult:
         """The innermost tool call — what `wrap_tool_call` wraps."""
@@ -683,6 +1058,85 @@ def _as_k(value) -> int:
     except (TypeError, ValueError):
         return 5
     return max(1, min(MAX_SEARCH_K, k))
+
+
+def _lift_args(text: str, parsed):
+    """`parsed`, with arguments the model wrote BESIDE `tool` moved into
+    `args`.
+
+    `{"tool": "fetch_doc", "doc_id": "doc-0004"}` is ordinary real-model
+    output — gpt-4o-mini wrote it on 3 of 9 briefs — and the frozen
+    `parse_output` keeps only `args`, so the call went out as
+    `fetch_doc("")`, failed, and the model repeated it until it gave up.
+    This only ever touches an ACTION that lacks its required argument;
+    a FINAL is never re-read here.
+    """
+    need = _REQUIRED_ARG.get(parsed.tool) if parsed.kind == "action" else None
+    if need is None or need in parsed.args:
+        return parsed
+    for match in _ACTION_LINE_RE.finditer(text):
+        try:
+            payload = json.loads(match.group(1))
+        except ValueError:
+            continue
+        if isinstance(payload, dict) and payload.get("tool") == parsed.tool and need in payload:
+            lifted = {key: payload[key] for key in _ARG_KEYS if key in payload}
+            return replace(parsed, args={**lifted, **parsed.args})
+    return parsed
+
+
+def _compact_search(content) -> str:
+    """A `search` observation reduced to `doc_id: title` per hit. Anything
+    that is not a result list (an error, noise) is already short and is
+    returned unchanged."""
+    if not isinstance(content, str):
+        return content
+    hits = _HIT_RE.findall(content)
+    if not hits:
+        return content
+    return "(kết quả search cũ, đã rút gọn) " + "; ".join(
+        f"{doc_id}: {title}" for doc_id, title in hits
+    )
+
+
+def _prefer(lines: list, doc_id):
+    """The line from the cited document if there is one, else the first."""
+    for line in lines:
+        if line[0] == doc_id:
+            return line
+    return lines[0] if lines else None
+
+
+def _closest(lines: list, needle: str, doc_id):
+    """The read line holding the largest share of `needle`'s words — at
+    least `PARAPHRASE_OVERLAP` of them — preferring the cited document."""
+    words = set(_WORD_RE.findall(needle))
+    if not words:
+        return None
+    best, best_key = None, (PARAPHRASE_OVERLAP, False)
+    for line in lines:
+        share = len(words & set(_WORD_RE.findall(line[2]))) / len(words)
+        key = (share, line[0] == doc_id)
+        if key >= best_key:
+            best, best_key = line, key
+    return best
+
+
+def _pointer(line: str) -> str:
+    """Point at a line by its ends: «first words … last words»."""
+    words = line.split()
+    if len(words) <= 2 * ANCHOR_WORDS:
+        return f"«{line}»"
+    head = " ".join(words[:ANCHOR_WORDS])
+    tail = " ".join(words[-ANCHOR_WORDS:])
+    return f"bắt đầu «{head}» và kết thúc «{tail}»"
+
+
+def _verbatim_claims(evidence: Evidence, report) -> int:
+    claims = report.get("claims") if isinstance(report, dict) else None
+    if not isinstance(claims, list):
+        return 0
+    return sum(1 for claim in claims if evidence.saw(claim_text(claim)))
 
 
 __all__ = [
