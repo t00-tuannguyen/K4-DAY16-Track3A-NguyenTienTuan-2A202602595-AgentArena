@@ -47,6 +47,9 @@ nên lớp cần "chốt hạ" cuối cùng phải đứng đầu tiên.
 
 from __future__ import annotations
 
+from arena.corpus import INJECTION_CANARY
+from arena.tools import ToolResult
+
 from harness.middleware import Middleware
 
 #: Dấu mốc của đoạn nội dung không đáng tin trong kho tài liệu.
@@ -69,10 +72,38 @@ class InjectionGuard(Middleware):
         #     cắt từ BLOCK_START tới hết chuỗi.
         #  3. Lặp lại cho tới khi không còn BLOCK_START nào.
         #  4. Trả về ToolResult(ok=result.ok, content=<đã sạch>, error=result.error).
-        return result  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        if result is None or not hasattr(result, "content"):
+            return result
+        content = result.content if isinstance(result.content, str) else ""
+        if BLOCK_START not in content and INJECTION_CANARY not in content:
+            return result
+        ctx.state["injection_blocks"] = ctx.state.get("injection_blocks", 0) + 1
+        return ToolResult(ok=result.ok, content=_quarantine(content), error=result.error)
 
     def after_agent(self, ctx, report):
         # TODO (§10): 2-4 dòng.
         #  Nếu INJECTION_CANARY còn trong report["answer"] thì gỡ nó ra.
         #  Chỉ sửa "answer" — tuyệt đối không sửa text của claim.
-        return report  # <- mặc định KHÔNG LÀM GÌ
+        if not isinstance(report, dict):
+            return report
+        for key in ("answer", "verdict"):
+            value = report.get(key)
+            if isinstance(value, str) and INJECTION_CANARY in value:
+                report[key] = value.replace(INJECTION_CANARY, "").strip()
+        claims = report.get("claims")
+        if isinstance(claims, list):
+            # Xoá cả claim chứ không "làm sạch" chữ của nó (README §8.2).
+            report["claims"] = [
+                claim for claim in claims if INJECTION_CANARY not in str(claim)
+            ]
+        return report
+
+
+def _quarantine(content: str) -> str:
+    """Cắt mọi đoạn BLOCK_START..BLOCK_END; thiếu dấu mốc đóng thì cắt tới hết."""
+    while BLOCK_START in content:
+        start = content.index(BLOCK_START)
+        end = content.find(BLOCK_END, start)
+        tail = "" if end == -1 else content[end + len(BLOCK_END):]
+        content = content[:start] + PLACEHOLDER + tail
+    return content.replace(INJECTION_CANARY, PLACEHOLDER)

@@ -61,7 +61,7 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
-from arena.model import is_degraded  # noqa: F401  (dùng trong phần TODO)
+from arena.model import is_degraded
 
 from harness.middleware import Middleware
 
@@ -98,4 +98,36 @@ class Retry(Middleware):
         #  3. Trả về kết quả cuối cùng (kể cả khi vẫn hỏng: agent phải
         #     nhìn thấy sự thật, đừng bịa nội dung thay nó).
         #  4. Ghi số lần đã thử vào ctx.state để gỡ lỗi.
-        return result  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        attempts = 1
+        while (
+            attempts < self.max_attempts
+            and _broken(result)
+            and not self._spent(ctx)
+            and _retryable(ctx, name, args)
+        ):
+            result = call(name, args)
+            attempts += 1
+        ctx.state["retry_attempts"] = ctx.state.get("retry_attempts", 0) + attempts - 1
+        return result
+
+    def _spent(self, ctx) -> bool:
+        limit = ctx.max_tool_calls
+        return limit is not None and ctx.tools.calls >= limit - self.reserve
+
+
+def _broken(result) -> bool:
+    if result is None or not hasattr(result, "ok"):
+        return False
+    content = result.content if isinstance(result.content, str) else ""
+    return (not result.ok) or is_degraded(content)
+
+
+def _retryable(ctx, name, args) -> bool:
+    """Một doc_id không có trong corpus thì gọi lại bao nhiêu lần cũng vậy.
+
+    Tầng tool chập chờn không bao giờ sinh "doc not found"; lỗi đó chỉ đến
+    từ một doc_id do mô hình bịa ra, nên thử lại chỉ đốt ngân sách.
+    """
+    if name == "fetch_doc" and ctx.corpus is not None and isinstance(args, dict):
+        return ctx.corpus.get(str(args.get("doc_id", ""))) is not None
+    return True
